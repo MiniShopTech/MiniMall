@@ -1,0 +1,177 @@
+﻿using AutoMapper;
+using MayNghien.Models.Response.Base;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
+using MiniMall.DALs.Entities;
+using MiniMall.DALs.Repositories.Interfaces;
+using MiniMall.Models.DTOs.Requests;
+using MiniMall.Models.DTOs.Responses;
+using MiniMall.Services.Interfaces;
+
+namespace MiniMall.Services.Implements
+{
+    public class CartService : ICartService
+    {
+        private readonly IProductRepository _productRepository;
+        private readonly IVariantRepository _variantRepository;
+        private readonly ICartRepository _cartRepository;
+        private readonly IMapper _mapper;
+        private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly UserManager<ApplicationUser> _userManager;
+
+        public CartService(IProductRepository productRepository, ICartRepository cartRepository,
+            IMapper mapper, IHttpContextAccessor httpContextAccessor, UserManager<ApplicationUser> userManager, 
+            IVariantRepository variantRepository)
+        {
+            _productRepository = productRepository;
+            _cartRepository = cartRepository;
+            _mapper = mapper;
+            _httpContextAccessor = httpContextAccessor;
+            _userManager = userManager;
+            _variantRepository = variantRepository;
+        }
+
+        public async Task<AppResponse<CartResponse>> AddToCart(CartRequest request)
+        {
+            var result = new AppResponse<CartResponse>();
+            try
+            {
+                var user = await _userManager.FindByEmailAsync(_httpContextAccessor.HttpContext?.User.Identity?.Name!);
+                if (user == null)
+                    return result.BuildError("Unauthorize");
+
+                var product = _productRepository.FindByAsync(p => p.Id == request.ProductId).FirstOrDefault();
+                if (product == null || product.IsDeleted == true)
+                    return result.BuildError("Product not found or deleted");
+
+                var existingCart = _cartRepository
+                    .FindByAsync(c => c.ProductId == request.ProductId && c.Type == request.Type
+                    && c.TenantId == user!.TenantId && c.IsDeleted == false).FirstOrDefault();
+                if (existingCart != null)
+                {
+                    existingCart.Quantity += request.Quantity;
+                    existingCart.TotalAmount = CalculateTotalAmount(request.ProductId!.Value, request.VariantId!.Value,
+                        request.Type, existingCart.Quantity);
+                    _cartRepository.Delete(existingCart);
+                    var updatedCart = new Cart
+                    {
+                        Id = Guid.NewGuid(),
+                        ProductId = existingCart.ProductId,
+                        Type = existingCart.Type,
+                        Quantity = existingCart.Quantity,
+                        TotalAmount = existingCart.TotalAmount,
+                        TenantId = user!.TenantId,
+                        VariantId = request.VariantId,
+                        CreatedBy = user.Email,
+                        Modifiedby = user.Email,
+                        ModifiedOn = DateTime.UtcNow
+                    };
+                    _cartRepository.Add(updatedCart);
+
+                    var response = _mapper.Map<CartResponse>(updatedCart);
+                    response.ProductName = product.Name;
+                    var productPrice = _variantRepository.FindByAsync(p => p.Id == request.VariantId).FirstOrDefault();
+                    response.VariantName = productPrice?.Type!;
+                    result.BuildResult(response, "Cart updated successfully");
+                }
+                else
+                {
+                    var newCart = new Cart
+                    {
+                        Id = Guid.NewGuid(),
+                        ProductId = request.ProductId,
+                        Type = request.Type,
+                        Quantity = request.Quantity,
+                        TotalAmount = CalculateTotalAmount(request.ProductId!.Value, request.VariantId!.Value,
+                            request.Type, request.Quantity),
+                        TenantId = user!.TenantId,
+                        VariantId = request.VariantId,
+                        CreatedBy = user?.Email,
+                        CreatedOn = DateTime.UtcNow
+                    };
+                    _cartRepository.Add(newCart);
+
+                    var response = _mapper.Map<CartResponse>(newCart);
+                    response.ProductName = product.Name;
+                    var productPrice = _variantRepository.FindByAsync(p => p.Id == request.VariantId).FirstOrDefault();
+                    response.VariantName = productPrice?.Type!;
+                    result.BuildResult(response, "Added product to cart successfully");
+                }
+            }
+            catch (Exception ex)
+            {
+                result.BuildError(ex.Message);
+            }
+            return result;
+        }
+
+        private double CalculateTotalAmount(Guid productId, Guid variantId, string type, int quantity)
+        {
+            var product = _productRepository.FindByAsync(p => p.Id == productId).FirstOrDefault();
+            if (product == null || product.IsDeleted == true)
+                throw new Exception("Product not found or deleted");
+
+            var productPrice = _variantRepository.FindByAsync(p => p.Id == variantId && p.Type == type).FirstOrDefault();
+            if (productPrice == null || productPrice.IsDeleted == true)
+                throw new Exception("Variant not found or deleted for the given type");
+            return (product.Price + productPrice.Price) * quantity;
+        }
+
+        public AppResponse<string> RemoveFromCart(Guid productId)
+        {
+            var result = new AppResponse<string>();
+            try
+            {
+                var user = _httpContextAccessor.HttpContext?.User.Identity?.Name!;
+                if (user == null)
+                    return result.BuildError("Unauthorize");
+
+                var cart = _cartRepository.FindByAsync(c => c.ProductId == productId && c.IsDeleted == false).FirstOrDefault();
+                if (cart == null || cart.IsDeleted == true)
+                    return result.BuildError("Product not found or deleted in the cart");
+                if (cart.Quantity > 1)
+                {
+                    cart.Quantity -= 1;
+                    cart.TotalAmount = CalculateTotalAmount(cart.ProductId!.Value, cart.VariantId!.Value, cart.Type, cart.Quantity);
+                    _cartRepository.Edit(cart);
+                    result.BuildResult("Product quantity decreased successfully");
+                }
+                else
+                {
+                    cart.Quantity = 0;
+                    cart.IsDeleted = true;
+                    _cartRepository.Edit(cart);
+                    result.BuildResult("Product removed from cart successfully");
+                }
+            }
+            catch (Exception ex)
+            {
+                result.BuildError(ex.Message);
+            }
+            return result;
+        }
+
+        public AppResponse<string> DeleteFromCart(Guid productId)
+        {
+            var result = new AppResponse<string>();
+            try
+            {
+                var user = _httpContextAccessor.HttpContext?.User.Identity?.Name!;
+                if (user == null)
+                    return result.BuildError("Unauthorize");
+
+                var cart = _cartRepository.FindByAsync(c => c.ProductId == productId && c.IsDeleted == false).FirstOrDefault();
+                if (cart == null || cart.IsDeleted == true)
+                    return result.BuildError("Product not found or deleted in the cart");
+                cart.IsDeleted = true;
+                _cartRepository.Edit(cart);
+                result.BuildResult("Product removed from cart successfully");
+            }
+            catch (Exception ex)
+            {
+                result.BuildError(ex.Message);
+            }
+            return result;
+        }
+    }
+}
